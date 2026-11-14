@@ -1,4 +1,4 @@
-#!/home/dan/Documents/git/Sheltr/.venv/bin/python
+#!/home/dan/Documents/git/sheltr/.venv/bin/python
 import base64
 import json
 import mimetypes
