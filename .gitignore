@@ -1,0 +1,4 @@
+backups/
+vault_media/
+sheltr.db
+.venv/

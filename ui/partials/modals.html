@@ -1,0 +1,148 @@
+<!-- DOSSIER / EDIT MODAL -->
+<div id="dossierModal" class="modal-backdrop" onclick="if(event.target===this) closeModal()">
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modalHeaderTitle">
+    <div class="modal-header">
+      <span id="modalHeaderTitle">📂 DOSSIER.DAT</span>
+      <div style="display:inline-flex; gap:6px; align-items:center;">
+        <button type="button" id="prevEntryModalBtn" class="btn" style="padding:3px 8px;" onclick="stepDossierEntry(-1)" title="Previous Entry">◀</button>
+        <button type="button" id="nextEntryModalBtn" class="btn" style="padding:3px 8px;" onclick="stepDossierEntry(1)" title="Next Entry">▶</button>
+        <a id="visitLinkBtn" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="padding:3px 9px;">🔗 OPEN</a>
+        <button type="button" class="btn btn-danger" style="padding:3px 8px;" onclick="closeModal()">✖</button>
+      </div>
+    </div>
+
+    <form class="form-grid" onsubmit="saveDossier(event)">
+      <input type="hidden" id="editId" />
+
+      <div class="form-field">
+        <label for="editTitle">TRANSMISSION TITLE</label>
+        <input type="text" id="editTitle" required />
+      </div>
+
+      <div style="display:grid; grid-template-columns: 2fr 1fr; gap:10px;">
+        <div class="form-field">
+          <label for="editUrl">SOURCE URL (OPTIONAL FOR OFFLINE LOGS)</label>
+          <input type="url" id="editUrl" placeholder="https://..." />
+        </div>
+        <div class="form-field">
+          <label for="editType">CATEGORY</label>
+          <select id="editType" onchange="handleCategorySelectChange(this)"></select>
+        </div>
+      </div>
+
+      <div class="form-field">
+        <label>RATION STATUS</label>
+        <div id="statusSelector" class="status-selector"></div>
+      </div>
+
+      <div class="form-field">
+        <label>VAULT RATING TIER</label>
+        <div id="thumbSelector" class="thumb-selector"></div>
+      </div>
+
+      <div class="form-field tag-input-wrap">
+        <label for="editTags">TAGS (COMMA SEPARATED)</label>
+        <input type="text" id="editTags" autocomplete="off" placeholder="sci-fi, post-apoc, retro..." />
+        <div id="editTagsDropdown" class="tag-suggestions-dropdown"></div>
+      </div>
+
+      <div class="form-field">
+        <label>COVER VISUAL SIGNAL</label>
+        <div
+          class="cover-dropzone"
+          ondragover="event.preventDefault(); this.classList.add('dragover');"
+          ondragleave="this.classList.remove('dragover');"
+          ondrop="handleCoverDrop(event)"
+        >
+          <div class="cover-dropzone-hint" id="coverPreviewContent">
+            [ NO VISUAL SIGNAL ]<br />PASTE IMAGE [CTRL+V] OR DROP FILE
+          </div>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;">
+          <input type="file" id="coverFileInput" accept="image/*" style="display:none" onchange="handleCoverFileSelect(event)" />
+          <button type="button" class="btn" onclick="document.getElementById('coverFileInput').click()">📁 UPLOAD FILE</button>
+          <button type="button" id="clearCoverBtn" class="btn btn-danger" style="display:none;" onclick="clearModalCover()">🗑️ CLEAR COVER</button>
+          <input type="url" id="customCoverUrlInput" placeholder="Or paste image URL..." style="flex:1 1 180px;" />
+          <button type="button" class="btn" onclick="fetchCustomCoverUrl()">📡 FETCH URL</button>
+        </div>
+      </div>
+
+      <div id="scrapedDescBox"></div>
+
+      <div class="form-field">
+        <label for="editNotes">SURVIVAL LOG &amp; FIELD NOTES</label>
+        <textarea id="editNotes" rows="4" placeholder="Enter commentary, timestamps, or bunker notes..."></textarea>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:6px;">
+        <button type="button" id="deleteBtn" class="btn btn-danger" onclick="deleteCurrentEntry()">🔥 INCINERATE</button>
+        <div style="display:flex; gap:8px;">
+          <button type="button" class="btn" onclick="closeModal()">CANCEL</button>
+          <button type="submit" class="btn btn-primary">💾 COMMIT TO VAULT</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- CATEGORY MANAGER MODAL -->
+<div id="categoryModal" class="modal-backdrop" onclick="if(event.target===this) closeCategoryModal()">
+  <div class="modal-box" style="max-width:480px;" role="dialog" aria-modal="true">
+    <div class="modal-header">
+      <span>🏷️ CATEGORY_REGISTRY.CFG</span>
+      <button type="button" class="btn btn-danger" style="padding:3px 8px;" onclick="closeCategoryModal()">✖</button>
+    </div>
+
+    <form onsubmit="handleAddCategory(event)" style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;">
+      <div style="display:flex; gap:8px;">
+        <input type="text" id="newCategoryInput" placeholder="New category name..." style="flex:1;" required />
+        <input type="color" id="newCategoryColor" value="#818cf8" oninput="syncCategorySwatchHighlight(this.value)" style="width:42px; height:36px; padding:2px; cursor:pointer;" />
+        <button type="submit" class="btn btn-primary">+ ADD</button>
+      </div>
+      <div id="catColorPresets"></div>
+    </form>
+
+    <div id="categoryList"></div>
+  </div>
+</div>
+
+<!-- SAVE SEARCH MODAL -->
+<div id="saveSearchModal" class="modal-backdrop" onclick="if(event.target===this) closeSaveSearchModal()">
+  <div class="modal-box" style="max-width:460px;" role="dialog" aria-modal="true">
+    <div class="modal-header">
+      <span>📌 PIN_SEARCH_QUERY.BAT</span>
+      <button type="button" class="btn btn-danger" style="padding:3px 8px;" onclick="closeSaveSearchModal()">✖</button>
+    </div>
+
+    <form class="form-grid" onsubmit="submitSaveSearch(event)">
+      <div class="form-field">
+        <label for="saveSearchNameInput">SHORTCUT LABEL</label>
+        <input type="text" id="saveSearchNameInput" placeholder="e.g. Diamond Sci-Fi" required />
+      </div>
+      <div class="form-field">
+        <label for="saveSearchQueryInput">SEARCH TEXT / #TAGS</label>
+        <input type="text" id="saveSearchQueryInput" />
+      </div>
+      <label style="display:flex; align-items:center; gap:8px; font-family:var(--font-mono); font-size:0.74rem; color:var(--text-dim); cursor:pointer;">
+        <input type="checkbox" id="saveSearchIncludeFilters" />
+        <span id="saveSearchFiltersSummary">Also save current filter &amp; sort settings</span>
+      </label>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:6px;">
+        <button type="button" class="btn" onclick="closeSaveSearchModal()">CANCEL</button>
+        <button type="submit" class="btn btn-primary">📌 SAVE SHORTCUT</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- COVER LIGHTBOX -->
+<div id="coverLightbox" onclick="if(event.target===this) closeCoverLightbox()">
+  <div style="display:flex; justify-content:space-between; align-items:center; width:min(90vw, 900px); margin-bottom:10px; font-family:var(--font-mono); font-size:0.8rem; color:var(--accent-gold);">
+    <span id="coverLightboxTitle">🖼️ VISUAL_SIGNAL_INSPECTOR.IMG</span>
+    <button type="button" class="btn btn-danger" style="padding:3px 9px;" onclick="closeCoverLightbox()">✖ CLOSE [ESC]</button>
+  </div>
+  <img id="coverLightboxImg" src="" alt="Zoomed cover" onclick="toggleCoverLightboxZoom(event)" />
+  <div id="coverLightboxHintText" style="margin-top:10px; font-family:var(--font-mono); font-size:0.74rem; color:var(--text-dim);">
+    🔍 CLICK IMAGE TO ZOOM 2X
+  </div>
+</div>

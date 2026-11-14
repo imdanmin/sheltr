@@ -1,0 +1,1003 @@
+#!/home/dan/Documents/git/Sheltr/.venv/bin/python
+import base64
+import json
+import mimetypes
+import re
+import sqlite3
+import urllib.parse
+import urllib.request
+import uuid
+import zipfile
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import uvicorn
+
+
+def resolve_paths() -> tuple[Path, Path, Path, list[Path], Path]:
+    script_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd()
+    candidates = [
+        script_dir,
+        script_dir / "SHELTR_VAULT",
+        cwd,
+        cwd / "SHELTR_VAULT",
+    ]
+
+    # Locate UI directory
+    ui_dir = script_dir / "ui"
+    for base in candidates:
+        if (base / "ui" / "index.html").exists():
+            ui_dir = base / "ui"
+            break
+
+    # Locate existing sheltr.db or any media directory, otherwise default beside ui/
+    data_dir = ui_dir.parent
+    for base in candidates:
+        if (
+            (base / "sheltr.db").exists()
+            or (base / "vault_media").exists()
+            or (base / "media").exists()
+            or (base / "covers").exists()
+        ):
+            data_dir = base
+            break
+
+    db_path = data_dir / "sheltr.db"
+    vault_media_dir = data_dir / "vault_media"
+    legacy_media_dir = data_dir / "media"
+    legacy_covers_dir = data_dir / "covers"
+    backups_dir = data_dir / "backups"
+
+    vault_media_dir.mkdir(parents=True, exist_ok=True)
+    backups_dir.mkdir(parents=True, exist_ok=True)
+
+    search_dirs: list[Path] = []
+    for d in (vault_media_dir, legacy_media_dir, legacy_covers_dir):
+        if d not in search_dirs:
+            search_dirs.append(d)
+
+    return ui_dir, db_path, vault_media_dir, search_dirs, backups_dir
+
+
+UI_DIR, DB_PATH, VAULT_MEDIA_DIR, MEDIA_SEARCH_DIRS, BACKUPS_DIR = resolve_paths()
+
+app = FastAPI(title="SHELTR // Subterranean Media Vault")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+
+def get_table_names(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    return {r["name"] for r in rows}
+
+
+def get_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r["name"] for r in rows}
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        tables = get_table_names(conn)
+
+        if "media_types" not in tables:
+            conn.execute(
+                """
+                CREATE TABLE media_types (
+                    name TEXT PRIMARY KEY,
+                    color TEXT DEFAULT '#818cf8'
+                )
+                """
+            )
+        else:
+            mt_cols = get_column_names(conn, "media_types")
+            if "color" not in mt_cols:
+                conn.execute("ALTER TABLE media_types ADD COLUMN color TEXT DEFAULT '#818cf8'")
+
+        if "entries" not in tables:
+            conn.execute(
+                """
+                CREATE TABLE entries (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    url TEXT,
+                    domain TEXT,
+                    media_type TEXT DEFAULT '',
+                    status TEXT DEFAULT 'QUEUED',
+                    thumb_rating INTEGER DEFAULT 0,
+                    tags TEXT DEFAULT '[]',
+                    notes TEXT DEFAULT '',
+                    cover_path TEXT,
+                    metadata TEXT DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    consumed_at TEXT
+                )
+                """
+            )
+        else:
+            entry_cols = get_column_names(conn, "entries")
+            for col_name, col_def in [
+                ("domain", "TEXT"),
+                ("media_type", "TEXT DEFAULT ''"),
+                ("status", "TEXT DEFAULT 'QUEUED'"),
+                ("thumb_rating", "INTEGER DEFAULT 0"),
+                ("notes", "TEXT DEFAULT ''"),
+                ("cover_path", "TEXT"),
+                ("updated_at", "TEXT"),
+                ("consumed_at", "TEXT"),
+            ]:
+                if col_name not in entry_cols:
+                    conn.execute(f"ALTER TABLE entries ADD COLUMN {col_name} {col_def}")
+
+            if "metadata" not in entry_cols and "metadata_json" not in entry_cols:
+                conn.execute("ALTER TABLE entries ADD COLUMN metadata TEXT DEFAULT '{}'")
+
+            if "entry_tags" not in tables and "tags" not in entry_cols:
+                conn.execute("ALTER TABLE entries ADD COLUMN tags TEXT DEFAULT '[]'")
+
+            if "created_at" in entry_cols:
+                conn.execute(
+                    "UPDATE entries SET updated_at = created_at WHERE updated_at IS NULL OR updated_at = ''"
+                )
+
+        if "saved_searches" not in tables:
+            conn.execute(
+                """
+                CREATE TABLE saved_searches (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    query TEXT DEFAULT '',
+                    include_filters INTEGER DEFAULT 0,
+                    media_type TEXT DEFAULT 'ALL',
+                    status TEXT DEFAULT 'ALL',
+                    rating INTEGER DEFAULT -1,
+                    tag TEXT DEFAULT '',
+                    sort_by TEXT DEFAULT 'updated_at',
+                    sort_dir TEXT DEFAULT 'DESC'
+                )
+                """
+            )
+        else:
+            ss_cols = get_column_names(conn, "saved_searches")
+            for col_name, col_def in [
+                ("query", "TEXT DEFAULT ''"),
+                ("include_filters", "INTEGER DEFAULT 0"),
+                ("media_type", "TEXT DEFAULT 'ALL'"),
+                ("status", "TEXT DEFAULT 'ALL'"),
+                ("rating", "INTEGER DEFAULT -1"),
+                ("tag", "TEXT DEFAULT ''"),
+                ("sort_by", "TEXT DEFAULT 'updated_at'"),
+                ("sort_dir", "TEXT DEFAULT 'DESC'"),
+            ]:
+                if col_name not in ss_cols:
+                    conn.execute(f"ALTER TABLE saved_searches ADD COLUMN {col_name} {col_def}")
+
+        count = conn.execute("SELECT COUNT(*) FROM media_types").fetchone()[0]
+        if count == 0:
+            defaults = [
+                ("VIDEOS", "#818cf8"),
+                ("ARTICLES", "#38bdf8"),
+                ("BOOKS", "#d97757"),
+                ("MUSIC", "#c084fc"),
+                ("GAMES", "#fb7185"),
+            ]
+            conn.executemany("INSERT INTO media_types (name, color) VALUES (?, ?)", defaults)
+
+
+init_db()
+
+
+# --- SCHEMA-ADAPTIVE TAG & METADATA HELPERS ---
+def get_meta_column(conn: sqlite3.Connection) -> str:
+    cols = get_column_names(conn, "entries")
+    return "metadata_json" if "metadata_json" in cols else "metadata"
+
+
+def get_entry_tags(conn: sqlite3.Connection, row: sqlite3.Row) -> list[str]:
+    tables = get_table_names(conn)
+    entry_cols = get_column_names(conn, "entries")
+
+    if "entry_tags" in tables:
+        et_cols = get_column_names(conn, "entry_tags")
+        if "tag_id" in et_cols and "tags" in tables:
+            tag_rows = conn.execute(
+                """
+                SELECT t.name
+                FROM tags t
+                JOIN entry_tags et ON et.tag_id = t.id
+                WHERE et.entry_id = ?
+                ORDER BY t.name ASC
+                """,
+                (row["id"],),
+            ).fetchall()
+            return [r["name"] for r in tag_rows if r["name"]]
+        tag_col = "tag_name" if "tag_name" in et_cols else ("tag" if "tag" in et_cols else None)
+        if tag_col:
+            tag_rows = conn.execute(
+                f"SELECT {tag_col} AS name FROM entry_tags WHERE entry_id = ? ORDER BY {tag_col} ASC",
+                (row["id"],),
+            ).fetchall()
+            return [r["name"] for r in tag_rows if r["name"]]
+
+    if "tags" in entry_cols:
+        raw = row["tags"]
+        if isinstance(raw, list):
+            return raw
+        try:
+            parsed = json.loads(raw or "[]")
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    return []
+
+
+def set_entry_tags(conn: sqlite3.Connection, entry_id: str, clean_tags: list[str]) -> None:
+    tables = get_table_names(conn)
+    entry_cols = get_column_names(conn, "entries")
+
+    if "entry_tags" in tables:
+        et_cols = get_column_names(conn, "entry_tags")
+        conn.execute("DELETE FROM entry_tags WHERE entry_id = ?", (entry_id,))
+        if "tag_id" in et_cols and "tags" in tables:
+            for t in clean_tags:
+                conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (t,))
+                t_row = conn.execute("SELECT id FROM tags WHERE name = ?", (t,)).fetchone()
+                if t_row:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?, ?)",
+                        (entry_id, t_row["id"]),
+                    )
+        else:
+            tag_col = "tag_name" if "tag_name" in et_cols else ("tag" if "tag" in et_cols else None)
+            if tag_col:
+                for t in clean_tags:
+                    conn.execute(
+                        f"INSERT OR IGNORE INTO entry_tags (entry_id, {tag_col}) VALUES (?, ?)",
+                        (entry_id, t),
+                    )
+
+    if "tags" in entry_cols:
+        conn.execute("UPDATE entries SET tags = ? WHERE id = ?", (json.dumps(clean_tags), entry_id))
+
+
+def get_tag_counts(conn: sqlite3.Connection, media_type: str = "") -> list[dict[str, Any]]:
+    tables = get_table_names(conn)
+    entry_cols = get_column_names(conn, "entries")
+
+    if "entry_tags" in tables:
+        et_cols = get_column_names(conn, "entry_tags")
+        if "tag_id" in et_cols and "tags" in tables:
+            if media_type and "media_type" in entry_cols:
+                rows = conn.execute(
+                    """
+                    SELECT LOWER(TRIM(t.name)) AS name, COUNT(*) AS count
+                    FROM tags t
+                    JOIN entry_tags et ON et.tag_id = t.id
+                    JOIN entries e ON e.id = et.entry_id
+                    WHERE e.media_type = ? AND TRIM(t.name) != ''
+                    GROUP BY LOWER(TRIM(t.name))
+                    ORDER BY count DESC, name ASC
+                    """,
+                    (media_type,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT LOWER(TRIM(t.name)) AS name, COUNT(*) AS count
+                    FROM tags t
+                    JOIN entry_tags et ON et.tag_id = t.id
+                    WHERE TRIM(t.name) != ''
+                    GROUP BY LOWER(TRIM(t.name))
+                    ORDER BY count DESC, name ASC
+                    """
+                ).fetchall()
+            return [{"name": r["name"], "count": r["count"]} for r in rows]
+
+        tag_col = "tag_name" if "tag_name" in et_cols else ("tag" if "tag" in et_cols else None)
+        if tag_col:
+            if media_type and "media_type" in entry_cols:
+                rows = conn.execute(
+                    f"""
+                    SELECT LOWER(TRIM(et.{tag_col})) AS name, COUNT(*) AS count
+                    FROM entry_tags et
+                    JOIN entries e ON e.id = et.entry_id
+                    WHERE e.media_type = ? AND TRIM(et.{tag_col}) != ''
+                    GROUP BY LOWER(TRIM(et.{tag_col}))
+                    ORDER BY count DESC, name ASC
+                    """,
+                    (media_type,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"""
+                    SELECT LOWER(TRIM({tag_col})) AS name, COUNT(*) AS count
+                    FROM entry_tags
+                    WHERE TRIM({tag_col}) != ''
+                    GROUP BY LOWER(TRIM({tag_col}))
+                    ORDER BY count DESC, name ASC
+                    """
+                ).fetchall()
+            return [{"name": r["name"], "count": r["count"]} for r in rows]
+
+    if "tags" in entry_cols:
+        if media_type and "media_type" in entry_cols:
+            rows = conn.execute("SELECT tags FROM entries WHERE media_type = ?", (media_type,)).fetchall()
+        else:
+            rows = conn.execute("SELECT tags FROM entries").fetchall()
+
+        counts: dict[str, int] = {}
+        for r in rows:
+            for t in json.loads(r["tags"] or "[]"):
+                tl = t.strip().lower()
+                if tl:
+                    counts[tl] = counts.get(tl, 0) + 1
+        return [{"name": k, "count": v} for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+    return []
+
+
+# --- HTML METADATA SCRAPER ---
+class MetaScraper(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_title = False
+        self.title_chunks: list[str] = []
+        self.description = ""
+        self.og_image = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attr_map = {k.lower(): (v or "") for k, v in attrs}
+        if tag.lower() == "title":
+            self.in_title = True
+        elif tag.lower() == "meta":
+            prop = attr_map.get("property", "").lower()
+            name = attr_map.get("name", "").lower()
+            content = attr_map.get("content", "").strip()
+            if not content:
+                return
+            if prop == "og:title" and not self.title_chunks:
+                self.title_chunks = [content]
+            elif (prop == "og:description" or name == "description") and not self.description:
+                self.description = content
+            elif prop in ("og:image", "twitter:image") and not self.og_image:
+                self.og_image = content
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "title":
+            self.in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.title_chunks.append(data)
+
+
+def extract_domain(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
+    host = parsed.netloc.lower()
+    return host[4:] if host.startswith("www.") else (host or None)
+
+
+def download_image_to_vault(image_url: str) -> Optional[str]:
+    try:
+        req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0 SHELTR-Vault/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if not content_type.startswith("image/"):
+                return None
+            ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".jpg"
+            if ext == ".jpe":
+                ext = ".jpg"
+            filename = f"{uuid.uuid4().hex}{ext}"
+            dest = VAULT_MEDIA_DIR / filename
+            dest.write_bytes(resp.read())
+            return f"/vault_media/{filename}"
+    except Exception:
+        return None
+
+
+def scrape_url(url: str) -> tuple[str, str, Optional[str]]:
+    normalized = url if "://" in url else f"https://{url}"
+    fallback_title = extract_domain(normalized) or normalized
+    try:
+        req = urllib.request.Request(normalized, headers={"User-Agent": "Mozilla/5.0 SHELTR-Vault/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw_bytes = resp.read(512_000)
+            html = raw_bytes.decode("utf-8", errors="ignore")
+        parser = MetaScraper()
+        parser.feed(html)
+        title = re.sub(r"\s+", " ", "".join(parser.title_chunks)).strip() or fallback_title
+        desc = re.sub(r"\s+", " ", parser.description).strip()
+        cover_path = None
+        if parser.og_image:
+            abs_img = urllib.parse.urljoin(normalized, parser.og_image)
+            cover_path = download_image_to_vault(abs_img)
+        return title, desc, cover_path
+    except Exception:
+        return fallback_title, "", None
+
+
+def normalize_cover_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    clean = path.strip()
+    if not clean:
+        return None
+    if clean.startswith(("http://", "https://", "data:", "/")):
+        return clean
+    if clean.startswith(("media/", "vault_media/", "covers/")):
+        return f"/{clean}"
+    return f"/vault_media/{clean}"
+
+
+def resolve_media_file(filename: str) -> Optional[Path]:
+    clean_rel = Path(filename)
+    if clean_rel.is_absolute() or ".." in clean_rel.parts:
+        return None
+    for base_dir in MEDIA_SEARCH_DIRS:
+        if not base_dir.exists():
+            continue
+        candidate = (base_dir / clean_rel).resolve()
+        try:
+            candidate.relative_to(base_dir.resolve())
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def row_to_entry(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
+    raw_meta = row["metadata_json"] if "metadata_json" in keys else (row["metadata"] if "metadata" in keys else "{}")
+    try:
+        meta_obj = json.loads(raw_meta or "{}")
+    except Exception:
+        meta_obj = {}
+
+    created_at = row["created_at"] if "created_at" in keys else utc_now()
+    updated_at = (row["updated_at"] if "updated_at" in keys else None) or created_at
+    raw_cover = row["cover_path"] if "cover_path" in keys else None
+
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "url": row["url"] if "url" in keys else None,
+        "domain": row["domain"] if "domain" in keys else None,
+        "media_type": (row["media_type"] if "media_type" in keys else "") or "",
+        "status": (row["status"] if "status" in keys else "QUEUED") or "QUEUED",
+        "thumb_rating": int((row["thumb_rating"] if "thumb_rating" in keys else 0) or 0),
+        "tags": get_entry_tags(conn, row),
+        "notes": (row["notes"] if "notes" in keys else "") or "",
+        "cover_path": normalize_cover_path(raw_cover),
+        "metadata": meta_obj,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "consumed_at": row["consumed_at"] if "consumed_at" in keys else None,
+    }
+
+
+def filter_entries_in_memory(
+    entries: list[dict[str, Any]],
+    q: str = "",
+    tag: str = "",
+) -> list[dict[str, Any]]:
+    results = entries
+
+    if q.strip():
+        needle = q.strip().lower()
+        results = [
+            e
+            for e in results
+            if needle in e["title"].lower()
+            or needle in e["notes"].lower()
+            or needle in (e["domain"] or "").lower()
+            or any(needle in t.lower() for t in e["tags"])
+            or needle in json.dumps(e["metadata"]).lower()
+        ]
+
+    if tag.strip():
+        req_tags = [t.strip().lower().lstrip("#") for t in tag.split(",") if t.strip()]
+        if req_tags:
+            results = [
+                e
+                for e in results
+                if all(req in [t.lower() for t in e["tags"]] for req in req_tags)
+            ]
+
+    return results
+
+
+def query_filtered_entries(
+    conn: sqlite3.Connection,
+    q: str = "",
+    media_type: str = "ALL",
+    status: str = "ALL",
+    rating: int = -1,
+    tag: str = "",
+    sort_by: str = "updated_at",
+    sort_dir: str = "DESC",
+) -> list[dict[str, Any]]:
+    entry_cols = get_column_names(conn, "entries")
+    allowed_sort = {
+        "updated_at",
+        "created_at",
+        "title",
+        "thumb_rating",
+        "domain",
+        "media_type",
+        "status",
+        "consumed_at",
+    } & entry_cols
+    col = sort_by if sort_by in allowed_sort else ("updated_at" if "updated_at" in entry_cols else "created_at")
+    direction = "ASC" if sort_dir.upper() == "ASC" else "DESC"
+
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if media_type and media_type != "ALL" and "media_type" in entry_cols:
+        clauses.append("media_type = ?")
+        params.append(media_type)
+
+    if status and status != "ALL" and "status" in entry_cols:
+        clauses.append("status = ?")
+        params.append(status)
+
+    if rating >= 0 and "thumb_rating" in entry_cols:
+        clauses.append("thumb_rating = ?")
+        params.append(rating)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    fallback_col = "created_at" if "created_at" in entry_cols else "id"
+    order_sql = f"ORDER BY COALESCE({col}, '') COLLATE NOCASE {direction}, {fallback_col} DESC"
+
+    rows = conn.execute(f"SELECT * FROM entries {where_sql} {order_sql}", params).fetchall()
+    entries = [row_to_entry(conn, r) for r in rows]
+    return filter_entries_in_memory(entries, q=q, tag=tag)
+
+
+# --- PYDANTIC SCHEMAS ---
+class MediaTypeCreate(BaseModel):
+    name: str
+    color: Optional[str] = "#818cf8"
+
+
+class MediaTypePatch(BaseModel):
+    color: str
+
+
+class IngestRequest(BaseModel):
+    url: str
+    media_type: str = ""
+    status: str = "QUEUED"
+    tags: list[str] = []
+
+
+class EntryCreate(BaseModel):
+    title: str
+    url: Optional[str] = None
+    media_type: str = ""
+    status: str = "QUEUED"
+    thumb_rating: int = 0
+    tags: list[str] = []
+    notes: str = ""
+    cover_path: Optional[str] = None
+
+
+class EntryPatch(BaseModel):
+    title: Optional[str] = None
+    url: Optional[str] = None
+    media_type: Optional[str] = None
+    status: Optional[str] = None
+    thumb_rating: Optional[int] = None
+    tags: Optional[list[str]] = None
+    notes: Optional[str] = None
+    cover_path: Optional[str] = None
+    clear_cover: Optional[bool] = False
+
+
+class UploadDataUrlRequest(BaseModel):
+    data_url: str
+
+
+class FetchCoverUrlRequest(BaseModel):
+    image_url: str
+
+
+class SavedSearchCreate(BaseModel):
+    name: str
+    query: str = ""
+    include_filters: bool = False
+    media_type: str = "ALL"
+    status: str = "ALL"
+    rating: int = -1
+    tag: str = ""
+    sort_by: str = "updated_at"
+    sort_dir: str = "DESC"
+
+
+# --- API ENDPOINTS ---
+@app.get("/api/media-types")
+def list_media_types():
+    with get_db() as conn:
+        rows = conn.execute("SELECT name, color FROM media_types ORDER BY name ASC").fetchall()
+        return [{"name": r["name"], "color": r["color"] or "#818cf8"} for r in rows]
+
+
+@app.post("/api/media-types")
+def create_media_type(payload: MediaTypeCreate):
+    clean = payload.name.strip().upper()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Category name required")
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO media_types (name, color) VALUES (?, ?)",
+            (clean, payload.color or "#818cf8"),
+        )
+    return {"name": clean, "color": payload.color or "#818cf8"}
+
+
+@app.patch("/api/media-types/{name}")
+def update_media_type(name: str, payload: MediaTypePatch):
+    with get_db() as conn:
+        conn.execute("UPDATE media_types SET color = ? WHERE name = ?", (payload.color, name))
+    return {"name": name, "color": payload.color}
+
+
+@app.delete("/api/media-types/{name}")
+def delete_media_type(name: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM media_types WHERE name = ?", (name,))
+    return {"ok": True}
+
+
+@app.get("/api/tags")
+def list_tags(
+    q: str = "",
+    media_type: str = "",
+    status: str = "ALL",
+    rating: int = -1,
+    tag: str = "",
+):
+    with get_db() as conn:
+        if not q.strip() and status == "ALL" and rating < 0 and not tag.strip():
+            return get_tag_counts(conn, media_type)
+
+        matching = query_filtered_entries(
+            conn,
+            q=q,
+            media_type=media_type or "ALL",
+            status=status,
+            rating=rating,
+            tag=tag,
+        )
+
+    counts: dict[str, int] = {}
+    for entry in matching:
+        for t in entry["tags"]:
+            tl = t.strip().lower()
+            if tl:
+                counts[tl] = counts.get(tl, 0) + 1
+
+    return [
+        {"name": k, "count": v}
+        for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+
+@app.get("/api/stats")
+def get_stats():
+    with get_db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        top_tags = get_tag_counts(conn)[:30]
+    return {"total": total, "top_tags": top_tags}
+
+
+@app.get("/api/entries")
+def list_entries(
+    q: str = "",
+    media_type: str = "ALL",
+    status: str = "ALL",
+    rating: int = -1,
+    tag: str = "",
+    sort_by: str = "updated_at",
+    sort_dir: str = "DESC",
+):
+    with get_db() as conn:
+        return query_filtered_entries(
+            conn,
+            q=q,
+            media_type=media_type,
+            status=status,
+            rating=rating,
+            tag=tag,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+
+
+def insert_entry_record(conn: sqlite3.Connection, values: dict[str, Any], clean_tags: list[str]) -> dict[str, Any]:
+    entry_cols = get_column_names(conn, "entries")
+    meta_col = get_meta_column(conn)
+    if "metadata" in values and meta_col != "metadata":
+        values[meta_col] = values.pop("metadata")
+
+    filtered = {k: v for k, v in values.items() if k in entry_cols}
+    cols_sql = ", ".join(filtered.keys())
+    placeholders = ", ".join(["?"] * len(filtered))
+    conn.execute(f"INSERT INTO entries ({cols_sql}) VALUES ({placeholders})", list(filtered.values()))
+    set_entry_tags(conn, values["id"], clean_tags)
+    row = conn.execute("SELECT * FROM entries WHERE id = ?", (values["id"],)).fetchone()
+    return row_to_entry(conn, row)
+
+
+@app.post("/api/ingest")
+def ingest_url(payload: IngestRequest):
+    raw_url = payload.url.strip()
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="URL is required")
+    normalized = raw_url if "://" in raw_url else f"https://{raw_url}"
+    title, desc, cover_path = scrape_url(normalized)
+    domain = extract_domain(normalized)
+    now = utc_now()
+    entry_id = uuid.uuid4().hex
+    clean_tags = list(dict.fromkeys(t.strip().lower().lstrip("#") for t in payload.tags if t.strip()))
+    consumed_at = now if payload.status == "CONSUMED" else None
+    meta = {"description": desc} if desc else {}
+
+    with get_db() as conn:
+        return insert_entry_record(
+            conn,
+            {
+                "id": entry_id,
+                "title": title,
+                "url": normalized,
+                "domain": domain,
+                "media_type": payload.media_type,
+                "status": payload.status,
+                "thumb_rating": 0,
+                "notes": "",
+                "cover_path": cover_path,
+                "metadata": json.dumps(meta),
+                "created_at": now,
+                "updated_at": now,
+                "consumed_at": consumed_at,
+            },
+            clean_tags,
+        )
+
+
+@app.post("/api/entries")
+def create_entry(payload: EntryCreate):
+    now = utc_now()
+    entry_id = uuid.uuid4().hex
+    normalized_url = payload.url.strip() if payload.url else None
+    if normalized_url and "://" not in normalized_url:
+        normalized_url = f"https://{normalized_url}"
+    domain = extract_domain(normalized_url)
+    clean_tags = list(dict.fromkeys(t.strip().lower().lstrip("#") for t in payload.tags if t.strip()))
+    consumed_at = now if payload.status == "CONSUMED" else None
+
+    with get_db() as conn:
+        return insert_entry_record(
+            conn,
+            {
+                "id": entry_id,
+                "title": payload.title.strip(),
+                "url": normalized_url,
+                "domain": domain,
+                "media_type": payload.media_type,
+                "status": payload.status,
+                "thumb_rating": payload.thumb_rating,
+                "notes": payload.notes,
+                "cover_path": payload.cover_path,
+                "metadata": "{}",
+                "created_at": now,
+                "updated_at": now,
+                "consumed_at": consumed_at,
+            },
+            clean_tags,
+        )
+
+
+@app.patch("/api/entries/{entry_id}")
+def update_entry(entry_id: str, payload: EntryPatch):
+    with get_db() as conn:
+        existing = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Entry not found")
+
+        entry_cols = get_column_names(conn, "entries")
+        now = utc_now()
+        updates: dict[str, Any] = {}
+
+        if payload.title is not None:
+            updates["title"] = payload.title.strip()
+
+        if payload.url is not None:
+            url = payload.url.strip() or None
+            if url and "://" not in url:
+                url = f"https://{url}"
+            updates["url"] = url
+            updates["domain"] = extract_domain(url)
+
+        if payload.media_type is not None:
+            updates["media_type"] = payload.media_type
+
+        if payload.status is not None:
+            updates["status"] = payload.status
+            existing_consumed = existing["consumed_at"] if "consumed_at" in entry_cols else None
+            if payload.status == "CONSUMED" and not existing_consumed:
+                updates["consumed_at"] = now
+            elif payload.status != "CONSUMED":
+                updates["consumed_at"] = None
+
+        if payload.thumb_rating is not None:
+            updates["thumb_rating"] = payload.thumb_rating
+
+        if payload.notes is not None:
+            updates["notes"] = payload.notes
+
+        if payload.clear_cover:
+            updates["cover_path"] = None
+        elif payload.cover_path is not None:
+            updates["cover_path"] = payload.cover_path
+
+        updates["updated_at"] = now
+
+        filtered = {k: v for k, v in updates.items() if k in entry_cols}
+        if filtered:
+            set_sql = ", ".join(f"{k} = ?" for k in filtered.keys())
+            conn.execute(f"UPDATE entries SET {set_sql} WHERE id = ?", [*filtered.values(), entry_id])
+
+        if payload.tags is not None:
+            clean_tags = list(dict.fromkeys(t.strip().lower().lstrip("#") for t in payload.tags if t.strip()))
+            set_entry_tags(conn, entry_id, clean_tags)
+
+        row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        return row_to_entry(conn, row)
+
+
+@app.delete("/api/entries/{entry_id}")
+def delete_entry(entry_id: str):
+    with get_db() as conn:
+        tables = get_table_names(conn)
+        if "entry_tags" in tables:
+            conn.execute("DELETE FROM entry_tags WHERE entry_id = ?", (entry_id,))
+        conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+    return {"ok": True}
+
+
+@app.post("/api/media/upload")
+def upload_cover_data_url(payload: UploadDataUrlRequest):
+    match = re.match(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", payload.data_url, re.DOTALL)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid image data URL")
+    mime, b64_data = match.groups()
+    ext = mimetypes.guess_extension(mime) or ".png"
+    if ext == ".jpe":
+        ext = ".jpg"
+    filename = f"{uuid.uuid4().hex}{ext}"
+    (VAULT_MEDIA_DIR / filename).write_bytes(base64.b64decode(b64_data))
+    return {"cover_path": f"/vault_media/{filename}"}
+
+
+@app.post("/api/media/fetch-url")
+def fetch_cover_from_url(payload: FetchCoverUrlRequest):
+    cover_path = download_image_to_vault(payload.image_url.strip())
+    if not cover_path:
+        raise HTTPException(status_code=400, detail="Unable to download image from URL")
+    return {"cover_path": cover_path}
+
+
+@app.get("/api/saved-searches")
+def list_saved_searches():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM saved_searches").fetchall()
+        return [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "query": r["query"] or "",
+                "include_filters": bool(r["include_filters"]),
+                "media_type": r["media_type"] or "ALL",
+                "status": r["status"] or "ALL",
+                "rating": int(r["rating"] if r["rating"] is not None else -1),
+                "tag": r["tag"] or "",
+                "sort_by": r["sort_by"] or "updated_at",
+                "sort_dir": r["sort_dir"] or "DESC",
+            }
+            for r in rows
+        ]
+
+
+@app.post("/api/saved-searches")
+def create_saved_search(payload: SavedSearchCreate):
+    search_id = uuid.uuid4().hex
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO saved_searches (
+                id, name, query, include_filters, media_type, status, rating, tag, sort_by, sort_dir
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                search_id,
+                payload.name,
+                payload.query,
+                int(payload.include_filters),
+                payload.media_type,
+                payload.status,
+                payload.rating,
+                payload.tag,
+                payload.sort_by,
+                payload.sort_dir,
+            ),
+        )
+    return {"id": search_id, **payload.model_dump()}
+
+
+@app.delete("/api/saved-searches/{search_id}")
+def delete_saved_search(search_id: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM saved_searches WHERE id = ?", (search_id,))
+    return {"ok": True}
+
+
+@app.post("/api/backup")
+def create_backup():
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"sheltr_vault_{stamp}.zip"
+    zip_path = BACKUPS_DIR / zip_name
+    seen_arcnames: set[str] = set()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        if DB_PATH.exists():
+            zf.write(DB_PATH, arcname="sheltr.db")
+        for media_dir in MEDIA_SEARCH_DIRS:
+            if not media_dir.exists():
+                continue
+            for img in media_dir.iterdir():
+                if img.is_file():
+                    arcname = f"vault_media/{img.name}"
+                    if arcname not in seen_arcnames:
+                        zf.write(img, arcname=arcname)
+                        seen_arcnames.add(arcname)
+    return {"db_backup": zip_name}
+
+
+# --- UNIFIED MEDIA ROUTES (SUPPORTS /vault_media, LEGACY /media, AND /covers) ---
+@app.get("/vault_media/{filename:path}")
+@app.get("/media/{filename:path}")
+@app.get("/covers/{filename:path}")
+def serve_vault_media(filename: str):
+    found = resolve_media_file(filename)
+    if not found:
+        raise HTTPException(status_code=404, detail="Media file not found")
+    return FileResponse(found)
+
+
+# --- STATIC UI MOUNT (MUST STAY AT BOTTOM AFTER ALL ROUTES) ---
+app.mount("/", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8420)

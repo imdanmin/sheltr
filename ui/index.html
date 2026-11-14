@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SHELTR // PIP_VAULT_OS.EXE</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link
+  rel="icon"
+  type="image/svg+xml"
+  href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpolygon points='20,3 44,3 61,20 61,44 44,61 20,61 3,44 3,20' fill='%23241e17' stroke='%23e3ad2b' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='22' fill='none' stroke='%23e3ad2b' stroke-width='2.5'/%3E%3Ccircle cx='32' cy='32' r='4.2' fill='%23e3ad2b'/%3E%3Cpath d='M28.75 26.37 L22.5 15.55 A19 19 0 0 1 41.5 15.55 L35.25 26.37 A6.5 6.5 0 0 0 28.75 26.37 Z' fill='%23e3ad2b'/%3E%3Cpath d='M38.5 32 L51 32 A19 19 0 0 1 41.5 48.45 L35.25 37.63 A6.5 6.5 0 0 0 38.5 32 Z' fill='%23e3ad2b'/%3E%3Cpath d='M28.75 37.63 L22.5 48.45 A19 19 0 0 1 13 32 L25.5 32 A6.5 6.5 0 0 0 28.75 37.63 Z' fill='%23e3ad2b'/%3E%3C/svg%3E"
+/>
+</head>
+<body>
+  <div class="os-window">
+    <div id="slot-header"></div>
+
+    <div class="workspace-grid">
+      <div id="slot-sidebar"></div>
+
+      <main class="main-stage">
+        <!-- INGEST DECK -->
+        <section class="ingest-panel" aria-label="Link Ingest Deck">
+          <form class="ingest-form" onsubmit="handleIngest(event)">
+            <input
+              type="url"
+              id="ingestUrl"
+              placeholder="📡 PASTE URL TO SCAVENGE & ARCHIVE (https://...)..."
+              required
+            />
+            <select id="ingestType" onchange="handleCategorySelectChange(this)" title="Category"></select>
+            <select id="ingestStatusSelect" title="Initial Ration Status">
+              <option value="QUEUED">🥫 QUEUED</option>
+              <option value="ACTIVE">🍲 ACTIVE</option>
+              <option value="CONSUMED">🍽️ CONSUMED</option>
+              <option value="DROPPED">🍄 DROPPED</option>
+            </select>
+            <div class="tag-input-wrap">
+              <input
+                type="text"
+                id="ingestTags"
+                placeholder="🏷️ tags, comma, separated..."
+                autocomplete="off"
+              />
+              <div id="ingestTagsDropdown" class="tag-suggestions-dropdown"></div>
+            </div>
+            <button type="submit" id="ingestBtn" class="btn btn-primary">⚡ INGEST</button>
+            <span id="ingestStatus" style="font-family:var(--font-mono); font-size:0.72rem; color:var(--accent-green);">[READY]</span>
+          </form>
+        </section>
+
+        <!-- SEARCH, FILTERS & TAG CLOUD -->
+        <section class="control-panel" aria-label="Archive Search and Filters">
+          <div class="search-row">
+            <input
+              type="search"
+              id="searchInput"
+              placeholder="🔍 SEARCH ARCHIVES OR TYPE #TAGS (PRESS [/] TO FOCUS)..."
+              oninput="handleSearchTyping()"
+            />
+            <select
+              id="filterType"
+              onchange="clearActiveSavedSearch(); syncShrineNavState(); loadEntries();"
+              title="Filter by Category"
+            ></select>
+            <button type="button" class="btn" onclick="openSaveSearchModal()">📌 SAVE QUERY</button>
+            <button type="button" class="btn btn-danger" onclick="resetAllFiltersAndSearch()">🧹 RESET</button>
+          </div>
+
+          <div id="savedSearchesBar" class="saved-searches-bar"></div>
+
+          <div class="filter-groups-row">
+            <!-- ROW 1: RATION STATUS -->
+            <div id="statusButtonGroup" class="button-group" role="group" aria-label="Filter by Status">
+              <button type="button" class="choice-btn active" data-val="ALL" onclick="selectStatusFilter('ALL')">ALL</button>
+              <button type="button" class="choice-btn" data-val="QUEUED" onclick="selectStatusFilter('QUEUED')">🥫 QUEUED</button>
+              <button type="button" class="choice-btn" data-val="ACTIVE" onclick="selectStatusFilter('ACTIVE')">🍲 ACTIVE</button>
+              <button type="button" class="choice-btn" data-val="CONSUMED" onclick="selectStatusFilter('CONSUMED')">🍽️ CONSUMED</button>
+              <button type="button" class="choice-btn" data-val="DROPPED" onclick="selectStatusFilter('DROPPED')">🍄 DROPPED</button>
+            </div>
+
+            <!-- ROW 2: THUMB TIERS (LOWEST TO HIGHEST) -->
+            <div id="ratingButtonGroup" class="button-group" role="group" aria-label="Filter by Thumb Rating">
+              <button type="button" class="choice-btn active" data-val="-1" onclick="selectRatingFilter('-1')">ALL THUMBS</button>
+              <button type="button" class="choice-btn thumb-btn-1" data-val="1" onclick="selectRatingFilter('1')">☠️ RED THUMB</button>
+              <button type="button" class="choice-btn thumb-btn-2" data-val="2" onclick="selectRatingFilter('2')">☣️ ORANGE THUMB</button>
+              <button type="button" class="choice-btn thumb-btn-3" data-val="3" onclick="selectRatingFilter('3')">👍 GREEN THUMB</button>
+              <button type="button" class="choice-btn thumb-btn-4" data-val="4" onclick="selectRatingFilter('4')">🏆 GOLD THUMB</button>
+              <button type="button" class="choice-btn thumb-btn-5" data-val="5" onclick="selectRatingFilter('5')">💎 DIAMOND THUMB</button>
+              <button type="button" class="choice-btn thumb-btn-0" data-val="0" onclick="selectRatingFilter('0')">🔘 UNSTAMPED</button>
+            </div>
+
+            <!-- ROW 3: SORT CONTROLS -->
+            <div class="filter-row">
+              <div id="sortButtonGroup" class="button-group" role="group" aria-label="Sort Field">
+                <button type="button" class="choice-btn active" data-val="updated_at" onclick="selectSortField('updated_at')">🕒 MODIFIED</button>
+                <button type="button" class="choice-btn" data-val="created_at" onclick="selectSortField('created_at')">📅 ADDED</button>
+                <button type="button" class="choice-btn" data-val="thumb_rating" onclick="selectSortField('thumb_rating')">💎 TIER</button>
+                <button type="button" class="choice-btn" data-val="title" onclick="selectSortField('title')">🔤 TITLE</button>
+                <button type="button" class="choice-btn" data-val="random" onclick="selectSortField('random')">🎲 SHUFFLE</button>
+              </div>
+              <button type="button" id="sortDirBtn" class="btn" onclick="toggleSortDir()">↓ DESC</button>
+            </div>
+          </div>
+
+          <div id="tagCloud"></div>
+        </section>
+
+        <!-- MATCH RESULTS BAR -->
+        <div class="match-results-bar">
+          <div>
+            📡 SIGNALS MATCHED: <span id="matchCountText">0</span>
+            <span id="matchTotalSubtext"></span>
+          </div>
+          <div id="activeFilterPills"></div>
+        </div>
+
+        <!-- ARCHIVE CARDS GRID -->
+        <section id="entriesGrid" aria-label="Archived Media Cards"></section>
+      </main>
+    </div>
+
+    <div id="slot-footer"></div>
+  </div>
+
+  <div id="slot-modals"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

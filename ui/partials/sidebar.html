@@ -1,0 +1,35 @@
+<aside class="bunker-sidebar">
+  <div class="sidebar-section">
+    <h2 class="sidebar-title">🕹️ COMMAND_DECK.BAT [SYS]</h2>
+    <div class="command-stack">
+      <button type="button" class="btn btn-primary" onclick="openManualModal()">➕ MANUAL LOG [N]</button>
+      <button type="button" class="btn" onclick="openCategoryModal()">🏷️ CATEGORIES [⚙️]</button>
+      <button type="button" class="btn" onclick="triggerBackup()">💾 COLD BACKUP [ZIP]</button>
+      <button type="button" class="btn" onclick="openRandomEntryDossier()">🎲 RANDOM SIGNAL</button>
+      <button
+        type="button"
+        class="btn"
+        onclick="document.body.classList.toggle('crt-off'); showToast(document.body.classList.contains('crt-off') ? '📺 CRT SCANLINES: OFF' : '📺 CRT SCANLINES: ON');"
+      >
+        📺 CRT SCANLINES [TV]
+      </button>
+    </div>
+  </div>
+
+  <div class="sidebar-section">
+    <h2 class="sidebar-title">🧭 SHRINE_INDEX [NAV]</h2>
+    <ul class="shrine-list">
+      <li><button type="button" class="shrine-link active" data-shrine="ALL" onclick="applyQuickFilter('ALL', '-1', this)">🌐 ALL SIGNALS</button></li>
+      <li><button type="button" class="shrine-link" data-shrine="QUEUED" onclick="applyQuickFilter('QUEUED', '-1', this)">🥫 QUEUED</button></li>
+      <li><button type="button" class="shrine-link" data-shrine="ACTIVE" onclick="applyQuickFilter('ACTIVE', '-1', this)">🍲 ACTIVE</button></li>
+      <li><button type="button" class="shrine-link" data-shrine="CONSUMED" onclick="applyQuickFilter('CONSUMED', '-1', this)">🍽️ CONSUMED</button></li>
+      <li><button type="button" class="shrine-link" data-shrine="DIAMOND" onclick="applyQuickFilter('ALL', '5', this)">💎 DIAMOND</button></li>
+      <li><button type="button" class="shrine-link" data-shrine="UNSTAMPED" onclick="applyQuickFilter('ALL', '0', this)">🔘 UNSTAMPED</button></li>
+    </ul>
+  </div>
+
+  <div class="sidebar-section">
+    <h2 class="sidebar-title">📮 PIP_STAMPS [99x56]</h2>
+    <div id="sidebarStampGrid" class="sidebar-stamp-grid"></div>
+  </div>
+</aside>
